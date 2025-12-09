@@ -1,43 +1,111 @@
 # countdown
 
-Countdown is terminal based multi-event countdown timer. It uses the [Bubble Tea](https://github.com/charmbracelet/bubbletea) TUI framework from [Charm\_](https://charm.sh/).
+Countdown is a terminal-based multi-event countdown timer with a graphical timeline. It uses the [Bubble Tea](https://github.com/charmbracelet/bubbletea) TUI framework from [Charm\_](https://charm.sh/).
 
-https://user-images.githubusercontent.com/96601789/182011443-15b35466-3969-490c-9f74-b30dcbd29a41.mp4
+## Features
+
+- **Multiple events**: Track as many countdowns as you need
+- **Visual timeline**: See upcoming events on a proportional timeline
+- **Urgency colors**: Events change color as they get closer (green → yellow → orange → red)
+- **Past events**: Track events that have already passed
+- **Live updates**: Countdowns update every second
+- **Detailed statistics**: View total seconds, minutes, hours, days, and years
+- **Responsive layout**: Adapts to your terminal size
 
 ## Installation
 
-Install using Golang's tools
+Install using Golang's tools:
 
 ```bash
-go install github.com/aldernero/countdown@latest
+go install github.com/rom41572/countdown@latest
 ```
 
-or clone and build
+Or clone and build:
 
 ```bash
-git clone https://github.com/aldernero/countdown.git
+git clone https://github.com/rom41572/countdown.git
 cd countdown
 go build -o countdown main.go
 ```
 
-When you launch it for the first time an `events.json` file will be created in the user's system-defined config directory:
+## Configuration
 
-- Linux: ~/.config/countdown/
-- macOS: ~/Library/Application Support/countdown/
-- Windows: %APPDATA%\countdown\
+When you launch it for the first time, an `events.json` file will be created in the user's system-defined config directory:
 
-On the first startup, just one prepopulated event (Golang's next anniversary) will be shown.
+- **Linux**: `~/.config/countdown/`
+- **macOS**: `~/Library/Application Support/countdown/`
+- **Windows**: `%APPDATA%\countdown\`
 
-![Screenshot_20220730_230038](https://user-images.githubusercontent.com/96601789/182010935-492b513e-4df4-48f8-8efb-28c1767ce2cb.png)
-
-As you add and remove events, the `events.json` file will be updated.
+On the first startup, one prepopulated event (Golang's next anniversary) will be shown.
 
 ## Usage
 
-The controls are
+### Keyboard Controls
 
-- "+" to add an event
-- "-" to remove an event
-- "/" to filter events
+| Key         | Action                    |
+| ----------- | ------------------------- |
+| `+`         | Add a new event           |
+| `-`         | Remove selected event     |
+| `e`         | Edit selected event       |
+| `↑`/`↓`     | Navigate events           |
+| `/`         | Filter events             |
+| `Tab`       | Next field (in forms)     |
+| `Shift+Tab` | Previous field (in forms) |
+| `Enter`     | Select/confirm            |
+| `Esc`       | Cancel/go back            |
+| `q`         | Quit                      |
 
-The rest of the controls are what you would expect, up/down to traverse the list, tab to move between fields in the event input form.
+### Date Formats
+
+When adding or editing events, use one of these formats:
+
+- **Date only**: `2025-12-31` (time defaults to 00:00:00)
+- **Date and time**: `2025-12-31 18:30:00`
+
+### Interface
+
+The interface has three panels:
+
+1. **Events List** (left): All your events sorted by date
+2. **Event Details** (center): Detailed countdown for the selected event
+3. **Timeline** (right): Visual timeline of upcoming events with proportional bars
+
+### Timeline
+
+The timeline shows upcoming events with visual bars representing time distance:
+
+```
+▼ NOW
+│
+├─■■■■■·························
+│ ● Meeting
+│   Dec 12 • 3 days
+│
+├─■■■■■■■■■■■■■■■···············
+│ ◆ Birthday Party
+│   Dec 25 • 16 days
+│
+▽ future
+```
+
+- `◆` = Selected event
+- `●` = Future event
+- Bar length = relative time until event
+
+### Urgency Colors
+
+Events are color-coded based on how soon they occur:
+
+| Time Remaining | Color       |
+| -------------- | ----------- |
+| > 30 days      | Green       |
+| 14-30 days     | Light green |
+| 7-14 days      | Yellow      |
+| 3-7 days       | Orange      |
+| 1-3 days       | Red         |
+| < 1 day        | Dark red    |
+| Past           | Purple      |
+
+## License
+
+MIT
