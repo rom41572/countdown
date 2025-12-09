@@ -1,4 +1,4 @@
-module github.com/aldernero/countdown
+module github.com/rom41572/countdown
 
 go 1.18
 
