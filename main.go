@@ -4,9 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -24,9 +25,9 @@ const (
 	secondsPerHour     = 3600
 	secondsPerMinute   = 60
 	timeout            = 365 * 24 * time.Hour
-	minListWidth       = 28
-	minDetailWidth     = 50
-	minTimelineWidth   = 45
+	minListWidth       = 20
+	minDetailWidth     = 35
+	minTimelineWidth   = 50
 	appName            = "countdown"
 	eventsFileName     = "events.json"
 	inputTimeFormShort = "2006-01-02"
@@ -210,20 +211,23 @@ func (e Event) Description() string { return countdownParser(e.Time) }
 func (e Event) FilterValue() string { return e.Name }
 
 type MainModel struct {
-	state         sessionState
-	focus         int
-	events        list.Model
-	inputs        []textinput.Model
-	timer         timer.Model
-	inputStatus   string
-	datePreview   string
-	dateValid     bool
-	editIndex     int
-	windowWidth   int
-	windowHeight  int
-	listWidth     int
-	detailWidth   int
-	timelineWidth int
+	state            sessionState
+	focus            int
+	events           list.Model
+	inputs           []textinput.Model
+	timer            timer.Model
+	inputStatus      string
+	datePreview      string
+	dateValid        bool
+	editIndex        int
+	windowWidth      int
+	windowHeight     int
+	listWidth        int
+	detailWidth      int
+	timelineWidth    int
+	onThisDay        []WikiEvent
+	onThisDayErr     error
+	onThisDayLoading bool
 }
 
 func (m *MainModel) calculateWidths() {
@@ -234,22 +238,29 @@ func (m *MainModel) calculateWidths() {
 		m.detailWidth = minDetailWidth
 		m.timelineWidth = minTimelineWidth
 	} else {
-		m.listWidth = max(minListWidth, availableWidth*25/100)
-		m.detailWidth = max(minDetailWidth, availableWidth*40/100)
-		m.timelineWidth = max(minTimelineWidth, availableWidth*35/100)
+		// Reduced list (15%) and detail (25%) columns, more space for Wikipedia (60%)
+		m.listWidth = max(minListWidth, availableWidth*15/100)
+		m.detailWidth = max(minDetailWidth, availableWidth*25/100)
+		m.timelineWidth = max(minTimelineWidth, availableWidth*60/100)
+	}
+
+	if len(m.events.Items()) >= 0 {
+		_, v := AppStyle.GetFrameSize()
+		m.events.SetSize(m.listWidth, m.windowHeight-v)
 	}
 }
 
 func NewMainModel() MainModel {
 	m := MainModel{
-		state:         showEvents,
-		timer:         timer.NewWithInterval(timeout, time.Second),
-		editIndex:     -1,
-		windowWidth:   120,
-		windowHeight:  40,
-		listWidth:     minListWidth,
-		detailWidth:   minDetailWidth,
-		timelineWidth: minTimelineWidth,
+		state:            showEvents,
+		timer:            timer.NewWithInterval(timeout, time.Second),
+		editIndex:        -1,
+		windowWidth:      120,
+		windowHeight:     40,
+		listWidth:        minListWidth,
+		detailWidth:      minDetailWidth,
+		timelineWidth:    minTimelineWidth,
+		onThisDayLoading: true,
 	}
 	events, err := readEventsFile()
 	if err != nil {
@@ -295,12 +306,23 @@ func NewMainModel() MainModel {
 }
 
 func (m MainModel) Init() tea.Cmd {
-	return m.timer.Init()
+	return tea.Batch(m.timer.Init(), fetchOnThisDay)
 }
 
 func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
+
+	switch msg := msg.(type) {
+	case OnThisDayMsg:
+		m.onThisDayLoading = false
+		if msg.err != nil {
+			m.onThisDayErr = msg.err
+		} else {
+			m.onThisDay = msg.events
+		}
+	}
+
 	switch m.state {
 	case noEvents:
 		switch msg := msg.(type) {
@@ -326,6 +348,10 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.events.SetSize(m.listWidth, msg.Height-v)
 			m.events.Styles.HelpStyle = lipgloss.NewStyle().Width(m.listWidth).Height(5)
 		case tea.KeyMsg:
+			// Don't process custom keybindings when filtering
+			if m.events.FilterState() == list.Filtering {
+				break
+			}
 			switch {
 			case key.Matches(msg, Keymap.Quit):
 				return m, tea.Quit
@@ -342,12 +368,14 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state = showEdit
 				}
 			case key.Matches(msg, Keymap.Remove):
-				m.events.RemoveItem(m.events.Index())
-				if err := m.saveEventsToFile(); err != nil {
-					panic(err)
-				}
-				if len(m.events.Items()) == 0 {
-					m.state = noEvents
+				if len(m.events.Items()) > 0 {
+					m.events.RemoveItem(m.events.Index())
+					if err := m.saveEventsToFile(); err != nil {
+						panic(err)
+					}
+					if len(m.events.Items()) == 0 {
+						m.state = noEvents
+					}
 				}
 			}
 		}
@@ -458,9 +486,12 @@ func (m MainModel) View() string {
 		return m.inputView("✏️  Edit Event")
 	default:
 		listStr := AppStyle.Render(m.events.View())
+		if m.events.SelectedItem() == nil {
+			return listStr
+		}
 		detailStr := m.detailsString()
-		timelineStr := m.renderTimeline()
-		return lipgloss.JoinHorizontal(lipgloss.Top, listStr, detailStr, timelineStr)
+		onThisDayStr := m.renderOnThisDay()
+		return lipgloss.JoinHorizontal(lipgloss.Top, listStr, detailStr, onThisDayStr)
 	}
 }
 
@@ -625,190 +656,10 @@ func renderTimeBlocks(years, days, hours, minutes, seconds int, color string, wi
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
-func (m MainModel) renderTimeline() string {
-	var b strings.Builder
-
-	items := m.events.Items()
-	if len(items) == 0 {
-		return ""
-	}
-
-	titleStyle := TimelineTitleStyle.Copy().Width(m.timelineWidth - 4)
-	b.WriteString("\n" + titleStyle.Render("📅 Upcoming Events") + "\n\n")
-
-	type timelineEvent struct {
-		event     Event
-		index     int
-		selected  bool
-		daysAway  int
-		hoursAway int
-	}
-
-	var events []timelineEvent
-	selectedIdx := m.events.Index()
-	now := time.Now()
-
-	for i, item := range items {
-		e := item.(Event)
-		eventTime := time.Unix(e.Time, 0)
-		if eventTime.After(now) {
-			diff := eventTime.Sub(now)
-			events = append(events, timelineEvent{
-				event:     e,
-				index:     i,
-				selected:  i == selectedIdx,
-				daysAway:  int(diff.Hours() / 24),
-				hoursAway: int(diff.Hours()),
-			})
-		}
-	}
-
-	if len(events) == 0 {
-		b.WriteString(HintStyle("  No upcoming events\n"))
-		return m.timelineStyle().Render(b.String())
-	}
-
-	sort.Slice(events, func(i, j int) bool {
-		return events[i].event.Time < events[j].event.Time
-	})
-
-	barWidth := m.timelineWidth - 25
-	if barWidth < 10 {
-		barWidth = 10
-	}
-	if barWidth > 40 {
-		barWidth = 40
-	}
-
-	b.WriteString(TimelineNowStyle.Render("  ▼ NOW") + "\n")
-	b.WriteString(TimelineNowStyle.Render("  │") + "\n")
-
-	maxEvents := (m.windowHeight - 15) / 5
-	if maxEvents < 3 {
-		maxEvents = 3
-	}
-	if maxEvents > 8 {
-		maxEvents = 8
-	}
-	displayed := 0
-
-	for _, te := range events {
-		if displayed >= maxEvents {
-			b.WriteString(TimelineTrackStyle.Render("  │\n"))
-			b.WriteString(TimelineTrackStyle.Render("  ⋮") + HintStyle(fmt.Sprintf(" +%d more events\n", len(events)-displayed)))
-			break
-		}
-
-		var timeBar string
-		var timeLabel string
-		color := getUrgencyColor(te.event.Time)
-		barStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
-		emptyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(cBarEmpty))
-		trackStyle := TimelineTrackStyle
-
-		if te.daysAway == 0 {
-			hours := te.hoursAway
-			if hours == 0 {
-				timeLabel = "< 1 hour"
-				blocks := 1
-				timeBar = barStyle.Render(strings.Repeat("▓", blocks)) + emptyStyle.Render(strings.Repeat("░", barWidth-blocks))
-			} else {
-				timeLabel = fmt.Sprintf("%d hours", hours)
-				blocks := (hours * barWidth) / 24
-				if blocks == 0 {
-					blocks = 1
-				}
-				if blocks > barWidth {
-					blocks = barWidth
-				}
-				timeBar = barStyle.Render(strings.Repeat("▓", blocks)) + emptyStyle.Render(strings.Repeat("░", barWidth-blocks))
-			}
-		} else if te.daysAway <= 7 {
-			timeLabel = fmt.Sprintf("%d day", te.daysAway)
-			if te.daysAway > 1 {
-				timeLabel += "s"
-			}
-			blocks := (te.daysAway * barWidth) / 7
-			if blocks == 0 {
-				blocks = 1
-			}
-			timeBar = barStyle.Render(strings.Repeat("█", blocks)) + emptyStyle.Render(strings.Repeat("░", barWidth-blocks))
-		} else if te.daysAway <= 30 {
-			timeLabel = fmt.Sprintf("%d days", te.daysAway)
-			blocks := (te.daysAway * barWidth) / 30
-			if blocks == 0 {
-				blocks = 1
-			}
-			timeBar = barStyle.Render(strings.Repeat("█", blocks)) + emptyStyle.Render(strings.Repeat("░", barWidth-blocks))
-		} else if te.daysAway <= 365 {
-			months := te.daysAway / 30
-			timeLabel = fmt.Sprintf("~%d month", months)
-			if months > 1 {
-				timeLabel += "s"
-			}
-			blocks := (te.daysAway * barWidth) / 365
-			if blocks == 0 {
-				blocks = 1
-			}
-			if blocks > barWidth {
-				blocks = barWidth
-			}
-			timeBar = barStyle.Render(strings.Repeat("█", blocks)) + emptyStyle.Render(strings.Repeat("░", barWidth-blocks))
-		} else {
-			years := te.daysAway / 365
-			timeLabel = fmt.Sprintf("~%d year", years)
-			if years > 1 {
-				timeLabel += "s"
-			}
-			timeBar = barStyle.Render(strings.Repeat("█", barWidth))
-		}
-
-		var marker string
-		var eventStyle lipgloss.Style
-		if te.selected {
-			marker = "◆"
-			eventStyle = TimelineSelectedStyle
-		} else {
-			marker = "●"
-			eventStyle = barStyle
-		}
-
-		b.WriteString(trackStyle.Render("  │") + "\n")
-		b.WriteString(trackStyle.Render("  ├─") + timeBar + "\n")
-
-		eventTime := time.Unix(te.event.Time, 0)
-		dateStr := eventTime.Format("Jan 02")
-		if eventTime.Year() != now.Year() {
-			dateStr = eventTime.Format("Jan 02 '06")
-		}
-
-		name := te.event.Name
-		maxNameLen := m.timelineWidth - 10
-		if maxNameLen < 15 {
-			maxNameLen = 15
-		}
-		if len(name) > maxNameLen {
-			name = name[:maxNameLen-3] + "..."
-		}
-
-		b.WriteString(trackStyle.Render("  │ "))
-		b.WriteString(eventStyle.Render(marker+" "+name) + "\n")
-		b.WriteString(trackStyle.Render("  │   "))
-		b.WriteString(HintStyle(dateStr+" • "+timeLabel) + "\n")
-
-		displayed++
-	}
-
-	b.WriteString(TimelineTrackStyle.Render("  │\n"))
-	b.WriteString(TimelineTrackStyle.Render("  ▽ future\n"))
-	b.WriteString("\n" + HintStyle("Bar length = time distance"))
-
-	return m.timelineStyle().Render(b.String())
-}
-
 func (m MainModel) timelineStyle() lipgloss.Style {
 	return lipgloss.NewStyle().
 		Width(m.timelineWidth).
+		Height(m.windowHeight-4).
 		Padding(1, 2).
 		Border(lipgloss.ThickBorder(), false, false, false, true).
 		BorderForeground(lipgloss.Color(cTimelineFuture))
@@ -1210,4 +1061,191 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+type WikiOnThisDay struct {
+	Selected []WikiEvent `json:"selected"`
+	Events   []WikiEvent `json:"events"`
+	Births   []WikiEvent `json:"births"`
+	Deaths   []WikiEvent `json:"deaths"`
+}
+
+type WikiEvent struct {
+	Text  string     `json:"text"`
+	Year  int        `json:"year"`
+	Pages []WikiPage `json:"pages"`
+}
+
+type WikiPage struct {
+	Title   string `json:"title"`
+	Extract string `json:"extract"`
+}
+
+type OnThisDayMsg struct {
+	events []WikiEvent
+	err    error
+}
+
+func fetchOnThisDay() tea.Msg {
+	now := time.Now()
+	month := int(now.Month())
+	day := now.Day()
+
+	url := fmt.Sprintf("https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/selected/%02d/%02d", month, day)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return OnThisDayMsg{err: err}
+	}
+	req.Header.Set("User-Agent", "CountdownApp/1.0 (https://github.com/countdown)")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return OnThisDayMsg{err: err}
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return OnThisDayMsg{err: err}
+	}
+
+	var data WikiOnThisDay
+	if err := json.Unmarshal(body, &data); err != nil {
+		return OnThisDayMsg{err: err}
+	}
+
+	events := data.Selected
+	if len(events) == 0 {
+		events = data.Events
+	}
+
+	return OnThisDayMsg{events: events}
+}
+
+func (m MainModel) renderOnThisDay() string {
+	var b strings.Builder
+
+	now := time.Now()
+	titleStyle := TimelineTitleStyle.Copy().Width(m.timelineWidth - 4)
+	b.WriteString("\n" + titleStyle.Render(fmt.Sprintf("📜 On This Day - %s", now.Format("January 2"))) + "\n\n")
+
+	if m.onThisDayLoading {
+		b.WriteString(HintStyle("  Loading historical events...") + "\n")
+		return m.timelineStyle().Render(b.String())
+	}
+
+	if m.onThisDayErr != nil {
+		b.WriteString(ErrStyle("  Failed to load events") + "\n")
+		b.WriteString(HintStyle("  "+m.onThisDayErr.Error()) + "\n")
+		return m.timelineStyle().Render(b.String())
+	}
+
+	if len(m.onThisDay) == 0 {
+		b.WriteString(HintStyle("  No historical events found") + "\n")
+		return m.timelineStyle().Render(b.String())
+	}
+
+	availableLines := m.windowHeight - 8
+	linesPerEvent := 4
+	maxEvents := availableLines / linesPerEvent
+	if maxEvents < 3 {
+		maxEvents = 3
+	}
+
+	yearStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(cTimelineSelected)).
+		Bold(true)
+
+	textStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.AdaptiveColor{Light: cDimmedTitleLight, Dark: cDimmedDescDark})
+
+	separatorStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(cTimelineTrack))
+
+	maxTextWidth := m.timelineWidth - 12
+	if maxTextWidth < 20 {
+		maxTextWidth = 20
+	}
+
+	for i, event := range m.onThisDay {
+		if i >= maxEvents {
+			remaining := len(m.onThisDay) - maxEvents
+			b.WriteString(HintStyle(fmt.Sprintf("  ... and %d more events", remaining)) + "\n")
+			break
+		}
+
+		yearsAgo := now.Year() - event.Year
+		yearLabel := fmt.Sprintf("%d (%d yrs ago)", event.Year, yearsAgo)
+		b.WriteString("  " + yearStyle.Render(yearLabel) + "\n")
+
+		text := event.Text
+
+		wrappedLines := wrapText(text, maxTextWidth)
+
+		if len(wrappedLines) > 2 {
+			wrappedLines = wrappedLines[:2]
+			lastLine := wrappedLines[1]
+			if len(lastLine) > maxTextWidth-3 {
+				lastLine = lastLine[:maxTextWidth-3]
+			}
+			wrappedLines[1] = lastLine + "..."
+		}
+
+		for _, line := range wrappedLines {
+			b.WriteString("  " + textStyle.Render(line) + "\n")
+		}
+
+		if i < maxEvents-1 && i < len(m.onThisDay)-1 {
+			b.WriteString(separatorStyle.Render("  ─────────") + "\n")
+		}
+	}
+
+	b.WriteString("\n" + HintStyle("  Source: Wikipedia"))
+
+	return m.timelineStyle().Render(b.String())
+}
+
+func wrapText(text string, maxWidth int) []string {
+	if maxWidth <= 0 {
+		maxWidth = 20
+	}
+
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return []string{}
+	}
+
+	var lines []string
+	var currentLine strings.Builder
+
+	for _, word := range words {
+		// If adding this word would exceed maxWidth
+		if currentLine.Len() > 0 && currentLine.Len()+1+len(word) > maxWidth {
+			lines = append(lines, currentLine.String())
+			currentLine.Reset()
+		}
+
+		// If the word itself is longer than maxWidth, truncate it
+		if len(word) > maxWidth {
+			if currentLine.Len() > 0 {
+				lines = append(lines, currentLine.String())
+				currentLine.Reset()
+			}
+			lines = append(lines, word[:maxWidth-3]+"...")
+			continue
+		}
+
+		if currentLine.Len() > 0 {
+			currentLine.WriteString(" ")
+		}
+		currentLine.WriteString(word)
+	}
+
+	if currentLine.Len() > 0 {
+		lines = append(lines, currentLine.String())
+	}
+
+	return lines
 }
